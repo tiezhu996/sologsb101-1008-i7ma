@@ -5,6 +5,7 @@
 import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
+import type { MeasureSnapshot } from '@/types/adjust'
 import { ROOM_TARGET_C } from '@/types/measure'
 
 /** 平衡判定阈值：失衡度 ≤ 10% 视为平衡 */
@@ -135,4 +136,82 @@ export function formatImbalance(value: number): string {
 export function measureHint(measure: Pick<Measure, 'flowM3h' | 'roomTempC'>, designFlowM3h: number): string {
   const value = imbalance(measure.flowM3h, designFlowM3h, measure.roomTempC)
   return `失衡度约 ${value.toFixed(1)}%`
+}
+
+/* ======================= 调节单冻结快照（实测与单据分离） ======================= */
+
+/** 构造快照所需的最小字段 */
+export interface SnapshotSource {
+  measure: Pick<
+    Measure,
+    'id' | 'date' | 'flowM3h' | 'supplyTempC' | 'returnTempC' | 'roomTempC'
+  > | null
+  valve: Pick<Valve, 'designFlowM3h' | 'currentOpening'>
+}
+
+/**
+ * 在派单 / 执行 / 复核时点冻结当时实测与阀门开度。
+ * 实测之后被补录、修改或删除，都不会改动该快照，原签字依据保持不变。
+ */
+export function buildMeasureSnapshot(source: SnapshotSource, frozenAt: number = Date.now()): MeasureSnapshot {
+  const { measure, valve } = source
+  const design = valve.designFlowM3h
+  const measured = measure ? measure.flowM3h : 0
+  const room = measure ? measure.roomTempC : ROOM_TARGET_C
+  const value = measure ? imbalance(measured, design, room) : 0
+  return {
+    measureId: measure ? measure.id : null,
+    measureDate: measure ? measure.date : '',
+    flowM3h: measured,
+    supplyTempC: measure ? measure.supplyTempC : 0,
+    returnTempC: measure ? measure.returnTempC : 0,
+    roomTempC: room,
+    designFlowM3h: design,
+    ratio: flowRatio(measured, design),
+    flowDeviation: measure ? flowDeviationPct(measured, design) : 0,
+    roomDeviation: measure ? roomDeviationC(room) : 0,
+    imbalanceValue: value,
+    level: measure ? balanceLevel(value, measured, design) : '平衡',
+    opening: valve.currentOpening,
+    frozenAt
+  }
+}
+
+/** 仅保留日期（YYYY-MM-DD，本地时区），避免 ISO 字符串的 UTC 偏移误判 */
+export function localDateOf(timestamp: number): string {
+  const date = new Date(timestamp)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+}
+
+/**
+ * 复核只认执行后新采集的数据：
+ * 实测日期晚于执行日期，或同日但录入时间晚于执行时刻的记录才算数。
+ */
+export function isMeasureAfterExecution(
+  measure: Pick<Measure, 'date' | 'createdAt'>,
+  executedAt: number
+): boolean {
+  const execDate = localDateOf(executedAt)
+  if (measure.date > execDate) return true
+  if (measure.date < execDate) return false
+  return (measure.createdAt ?? 0) > executedAt
+}
+
+/**
+ * 取执行后新采集的最新实测（按日期、录入时间取最晚一条）。
+ * 没有执行后的新数据时返回 null——此时不允许复核闭环。
+ */
+export function findReviewMeasure<T extends Measure>(
+  measures: T[],
+  valveId: string,
+  executedAt: number
+): T | null {
+  const candidates = measures
+    .filter((measure) => measure.valveId === valveId && isMeasureAfterExecution(measure, executedAt))
+    .sort((a, b) => {
+      const byDate = b.date.localeCompare(a.date)
+      return byDate !== 0 ? byDate : (b.createdAt ?? 0) - (a.createdAt ?? 0)
+    })
+  return candidates[0] ?? null
 }

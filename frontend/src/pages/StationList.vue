@@ -46,6 +46,14 @@ const pendingReviewOf = (stationId: string): number =>
     return valve ? valve.stationId === stationId : false
   }).length
 
+/** 其中因旧依据被改/删而退回待复测的数量 */
+const retestCountOf = (stationId: string): number =>
+  adjustStore.adjusts.filter((adjust) => {
+    if (adjust.state !== '待复测') return false
+    const valve = valveStore.valves.find((item) => item.id === adjust.valveId)
+    return valve ? valve.stationId === stationId : false
+  }).length
+
 const stationColumns = [
   { colKey: 'name', title: '楼栋', width: 140 },
   { colKey: 'area', title: '建筑面积', width: 120, cell: 'areaCell' },
@@ -298,7 +306,10 @@ function goValves(stationId: string): void {
             <span :style="{ color: imbalancedCountOf(station.id) > 0 ? '#c0392b' : undefined }">
               · 失衡 {{ imbalancedCountOf(station.id) }}
             </span>
-            <span>· 待复核 {{ pendingReviewOf(station.id) }}</span>
+            <span>· 待处理 {{ pendingReviewOf(station.id) }}</span>
+            <span v-if="retestCountOf(station.id) > 0" style="color: #c0392b">
+              （含待复测 {{ retestCountOf(station.id) }}）
+            </span>
           </div>
           <div class="card-list-item__meta" style="gap: 8px">
             <t-button size="small" variant="text" theme="primary" @click.stop="openEditStation(station)">

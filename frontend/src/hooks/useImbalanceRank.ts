@@ -3,7 +3,7 @@
  * 合成失衡度与建议目标开度，并按失衡度降序排列。
  * 被失衡度计算页、调节单页消费。
  */
-import { computed, type ComputedRef } from 'vue'
+import { computed, effectScope, type ComputedRef } from 'vue'
 import { useIdbTable, type UseIdbTableResult } from '@/hooks/useIdbTable'
 import { useStationStore } from '@/stores/stationStore'
 import { useValveStore } from '@/stores/valveStore'
@@ -60,7 +60,24 @@ export interface UseImbalanceRankResult {
   reload: () => Promise<void>
 }
 
+/**
+ * 全应用唯一的失衡排行实例（独立 effect scope，不随任何组件卸载而停止订阅）。
+ * 失衡排行、调节单、站内汇总统一从这里取数，保证三页展示同一套结果，
+ * 不再各自订阅 measures/valves 各算一份。
+ */
+let singleton: UseImbalanceRankResult | null = null
+
+function createImbalanceRank(): UseImbalanceRankResult {
+  const scope = effectScope(true)
+  return scope.run(() => createImbalanceRankInternal()) as UseImbalanceRankResult
+}
+
 export function useImbalanceRank(): UseImbalanceRankResult {
+  if (!singleton) singleton = createImbalanceRank()
+  return singleton
+}
+
+function createImbalanceRankInternal(): UseImbalanceRankResult {
   const stationStore = useStationStore()
   const valveStore = useValveStore()
   const measureTable = useIdbTable<MeasureRow>((database) => database.measures, { sortByUpdatedAt: false })

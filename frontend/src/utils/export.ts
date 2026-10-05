@@ -1,12 +1,10 @@
 /**
- * 导出工具：整库 JSON 存档、调节单 CSV、剪贴板复制
+ * 导出工具：整库 JSON 存档、调节单 CSV、失衡度排行 CSV、剪贴板复制
  */
 import type { Station } from '@/types/station'
 import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
-import type { Measure } from '@/types/measure'
 import type { Adjust } from '@/types/adjust'
-import { imbalance, balanceLevel, flowRatio } from '@/utils/balance'
 
 export function download(filename: string, content: string, mime: string): void {
   const blob = new Blob([content], { type: mime })
@@ -37,12 +35,20 @@ export function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
-/** 导出调节单 CSV（含失衡度与流量比） */
+function formatCsvTime(at: number | null | undefined): string {
+  if (!at) return '—'
+  return new Date(at).toLocaleString('zh-CN', { hour12: false })
+}
+
+/**
+ * 导出调节单 CSV。
+ * 依据列取派单/执行时冻结的 basisSnapshot（不随后续实测改动而变），
+ * 复核列取执行后新采集冻结的 reviewSnapshot，与调节单页、失衡排行同一口径。
+ */
 export function exportAdjustCsv(
   stations: Station[],
   buildings: Building[],
   valves: Valve[],
-  measures: Measure[],
   adjusts: Adjust[]
 ): string {
   const header = [
@@ -53,16 +59,25 @@ export function exportAdjustCsv(
     '口径DN',
     '位置',
     '设计流量(m³/h)',
-    '实测流量(m³/h)',
-    '流量比',
-    '室温(℃)',
-    '失衡度(%)',
+    '依据实测日期',
+    '依据实测流量(m³/h)',
+    '依据流量比',
+    '依据室温(℃)',
+    '依据开度(%)',
+    '依据失衡度(%)',
     '判级',
-    '当前开度(%)',
+    '执行前开度(%)',
     '目标开度(%)',
-    '调节依据',
+    '当前开度(%)',
+    '执行时间',
+    '执行后新采集日期',
+    '新实测流量(m³/h)',
+    '新流量比',
+    '新室温(℃)',
+    '新失衡度(%)',
     '执行人',
     '状态',
+    '退回待复测原因',
     '复核意见'
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
@@ -70,12 +85,8 @@ export function exportAdjustCsv(
     const valve = valves.find((item) => item.id === adjust.valveId)
     const building = valve ? buildings.find((item) => item.id === valve.buildingId) ?? null : null
     const station = building ? stations.find((item) => item.id === building.stationId) ?? null : null
-    const own = measures.filter((item) => item.valveId === adjust.valveId).sort((a, b) => a.date.localeCompare(b.date))
-    const latest = own[own.length - 1]
-    const design = valve ? valve.designFlowM3h : 0
-    const measured = latest ? latest.flowM3h : 0
-    const room = latest ? latest.roomTempC : 0
-    const value = imbalance(measured, design, room)
+    const basis = adjust.basisSnapshot
+    const review = adjust.reviewSnapshot
     lines.push(
       [
         station ? station.name : '—',
@@ -84,29 +95,38 @@ export function exportAdjustCsv(
         valve ? valve.code : '—',
         valve ? valve.dn : '—',
         valve ? valve.position : '—',
-        design,
-        latest ? measured : '—',
-        latest ? flowRatio(measured, design).toFixed(2) : '—',
-        latest ? room : '—',
-        value,
-        balanceLevel(value, measured, design),
-        valve ? valve.currentOpening : '—',
+        basis ? basis.designFlowM3h : valve ? valve.designFlowM3h : '—',
+        basis && basis.measureDate ? basis.measureDate : '—',
+        basis ? basis.flowM3h : '—',
+        basis ? basis.ratio.toFixed(2) : '—',
+        basis ? basis.roomTempC : '—',
+        basis ? basis.opening : '—',
+        basis ? basis.imbalanceValue : '—',
+        basis ? basis.level : '—',
+        adjust.beforeOpening ?? '—',
         adjust.targetOpening,
-        adjust.basis,
+        valve ? valve.currentOpening : '—',
+        formatCsvTime(adjust.executedAt),
+        review && review.measureDate ? review.measureDate : '—',
+        review ? review.flowM3h : '—',
+        review ? review.ratio.toFixed(2) : '—',
+        review ? review.roomTempC : '—',
+        review ? review.imbalanceValue : '—',
         adjust.executor,
         adjust.state,
-        adjust.reviewNote
+        adjust.invalidReason || '—',
+        adjust.reviewNote || '—'
       ]
         .map(csvCell)
         .join(',')
     )
   })
   const filename = `调节单-${stampSuffix()}.csv`
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 
-/** 导出失衡度排行 CSV */
+/** 导出失衡度排行 CSV（取全站统一的失衡排行结果） */
 export function exportBalanceCsv(
   rows: Array<{
     station: Station | null
@@ -141,7 +161,7 @@ export function exportBalanceCsv(
     )
   })
   const filename = `失衡度排行-${stampSuffix()}.csv`
-  download(filename, `\uFEFF${lines.join('\n')}`, 'text/csv;charset=utf-8')
+  download(filename, `﻿${lines.join('\n')}`, 'text/csv;charset=utf-8')
   return filename
 }
 

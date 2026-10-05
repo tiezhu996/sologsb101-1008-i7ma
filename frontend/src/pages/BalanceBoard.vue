@@ -16,7 +16,7 @@ import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
 import { useAdjustStore } from '@/stores/adjustStore'
 import { IMBALANCE_BALANCED, IMBALANCE_WARN, basisText, formatFlow, formatOpening } from '@/utils/balance'
-import { ADJUST_STATES, EMPTY_ADJUST_DRAFT, type AdjustDraft } from '@/types/adjust'
+import { EMPTY_ADJUST_DRAFT, type AdjustDraft } from '@/types/adjust'
 import { exportBalanceCsv } from '@/utils/export'
 import { HEAT_MODES, type HeatMode } from '@/types/building'
 
@@ -85,6 +85,11 @@ function describe(row: ImbalanceRow): string {
   })
 }
 
+/** 阀门当前调节单（若存在），用于回显状态 */
+function adjustOf(valveId: string) {
+  return adjustStore.adjusts.find((item) => item.valveId === valveId) ?? null
+}
+
 async function generateOne(row: ImbalanceRow): Promise<void> {
   if (row.level === '平衡') {
     MessagePlugin.info(`${row.valve.code} 处于平衡区间，无需下发调节单`)
@@ -98,9 +103,7 @@ async function generateOne(row: ImbalanceRow): Promise<void> {
     valveId: row.valve.id,
     targetOpening: row.suggestOpening,
     basis: describe(row),
-    executor: '待指派',
-    state: '待下发',
-    reviewNote: ''
+    executor: '待指派'
   })
   MessagePlugin.success(`已为 ${row.valve.code} 生成调节单，目标开度 ${row.suggestOpening}%`)
 }
@@ -109,6 +112,8 @@ async function generateOne(row: ImbalanceRow): Promise<void> {
 
 const adjustDialogVisible = ref(false)
 const adjustForm = reactive<AdjustDraft>({ ...EMPTY_ADJUST_DRAFT })
+/** 当前正在维护的调节单（仅待下发可改） */
+const adjustEditingId = ref<string | null>(null)
 
 function openAdjustEdit(row: ImbalanceRow): void {
   const adjust = adjustStore.adjusts.find((item) => item.valveId === row.valve.id)
@@ -116,23 +121,26 @@ function openAdjustEdit(row: ImbalanceRow): void {
     void generateOne(row)
     return
   }
+  if (adjust.state !== '待下发') {
+    MessagePlugin.info(`${row.valve.code} 的调节单已执行，依据已冻结，请到调节单页查看或复测`)
+    return
+  }
+  adjustEditingId.value = adjust.id
   Object.assign(adjustForm, {
     valveId: adjust.valveId,
     targetOpening: adjust.targetOpening,
     basis: adjust.basis,
-    executor: adjust.executor,
-    state: adjust.state,
-    reviewNote: adjust.reviewNote
+    executor: adjust.executor
   })
   adjustDialogVisible.value = true
 }
 
 async function submitAdjust(): Promise<void> {
-  const adjust = adjustStore.adjusts.find((item) => item.valveId === adjustForm.valveId)
-  if (!adjust) return
-  await adjustStore.updateAdjust(adjust.id, { ...adjustForm })
-  MessagePlugin.success('调节单已更新')
+  if (!adjustEditingId.value) return
+  await adjustStore.updateAdjust(adjustEditingId.value, { ...adjustForm })
+  MessagePlugin.success('调节单已更新，派单依据已按当前实测重新冻结')
   adjustDialogVisible.value = false
+  adjustEditingId.value = null
 }
 
 function removeAdjust(row: ImbalanceRow): void {
@@ -210,7 +218,7 @@ function goAdjust(): void {
       <div class="page-head__actions">
         <t-button variant="outline" @click="exportCsv">导出失衡度 CSV</t-button>
         <t-button variant="outline" @click="generateAll">一键生成调节单</t-button>
-        <t-button theme="primary" @click="goAdjust">前往调节单（{{ adjustStore.stateCounts['待下发'] }}）</t-button>
+        <t-button theme="primary" @click="goAdjust">前往调节单（{{ adjustStore.pendingCount }}）</t-button>
       </div>
     </div>
 
@@ -311,6 +319,9 @@ function goAdjust(): void {
               撤销
             </t-button>
           </div>
+          <div v-if="adjustOf(row.valve.id)" class="muted" style="font-size: 12px; margin-top: 2px">
+            状态：{{ adjustOf(row.valve.id)!.state }}
+          </div>
         </template>
       </t-table>
     </div>
@@ -332,13 +343,8 @@ function goAdjust(): void {
         <t-form-item label="执行人">
           <t-input v-model="adjustForm.executor" placeholder="如 王海" />
         </t-form-item>
-        <t-form-item label="状态">
-          <t-select v-model="adjustForm.state" :options="ADJUST_STATES.map((item) => ({ label: item, value: item }))" />
-        </t-form-item>
-        <t-form-item label="复核意见">
-          <t-input v-model="adjustForm.reviewNote" placeholder="复核合格可留空" />
-        </t-form-item>
       </t-form>
+      <p class="muted">仅待下发单据可修改；保存后按当前最新实测重新冻结派单依据。</p>
     </t-dialog>
   </div>
 </template>

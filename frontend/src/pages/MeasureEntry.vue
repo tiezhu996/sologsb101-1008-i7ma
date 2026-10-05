@@ -13,9 +13,10 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
+import { useAdjustStore } from '@/stores/adjustStore'
 import { useImbalanceRank } from '@/hooks/useImbalanceRank'
 import { EMPTY_MEASURE_DRAFT, type Measure, type MeasureDraft } from '@/types/measure'
-import type { MeasureRow } from '@/utils/db'
+import { invalidateAdjustsForMeasure, type MeasureRow } from '@/utils/db'
 import { balanceLevel, formatFlow, formatTemp, imbalance } from '@/utils/balance'
 import { parseMeasureBatch } from '@/utils/export'
 
@@ -23,6 +24,7 @@ type FilterModel = { keyword: string; [key: string]: string | string[] | boolean
 
 const valveStore = useValveStore()
 const stationStore = useStationStore()
+const adjustStore = useAdjustStore()
 const rank = useImbalanceRank()
 const measureTable = useIdbTable<MeasureRow>((database) => database.measures, { sortByUpdatedAt: false })
 
@@ -31,7 +33,7 @@ const detailDialogVisible = ref(false)
 const detailTitle = ref('录入实测')
 const form = reactive<MeasureDraft>({ ...EMPTY_MEASURE_DRAFT })
 const formRef = ref()
-let editingId: string | null = null
+const editingId = ref<string | null>(null)
 
 const batchText = ref('')
 const batchDialogVisible = ref(false)
@@ -74,6 +76,15 @@ const measuresOfActive = computed(() =>
     .sort((a, b) => b.date.localeCompare(a.date))
 )
 
+/** 被调节单冻结引用的实测：修改/删除这类记录会使原依据（含已复核结论）失效 */
+const frozenUsageOf = (measureId: string): number =>
+  adjustStore.adjusts.filter(
+    (adjust) =>
+      adjust.basisSnapshot?.measureId === measureId ||
+      adjust.reviewMeasureId === measureId ||
+      adjust.reviewSnapshot?.measureId === measureId
+  ).length
+
 const latestMeasures = computed(() =>
   [...measureTable.rows.value].sort((a, b) => b.date.localeCompare(a.date)).slice(0, 12)
 )
@@ -83,6 +94,9 @@ const previewImbalance = computed(() => {
   const value = imbalance(form.flowM3h, design, form.roomTempC)
   return { value, level: balanceLevel(value, form.flowM3h, design) }
 })
+
+/** 正在编辑的记录是否已被调节单冻结引用 */
+const editingFrozenCount = computed(() => (editingId.value ? frozenUsageOf(editingId.value) : 0))
 
 /* ------------------------------ 录入 ------------------------------ */
 
@@ -95,7 +109,7 @@ function openCreate(): void {
     MessagePlugin.warning('请先在左侧选择一只阀门')
     return
   }
-  editingId = null
+  editingId.value = null
   detailTitle.value = `录入实测 · ${activeValve.value.code}`
   Object.assign(form, {
     valveId: activeValve.value.id,
@@ -110,7 +124,7 @@ function openCreate(): void {
 }
 
 function openEdit(measure: Measure): void {
-  editingId = measure.id
+  editingId.value = measure.id
   detailTitle.value = `编辑实测 · ${measure.date}`
   Object.assign(form, {
     valveId: measure.valveId,
@@ -131,9 +145,22 @@ async function submit(): Promise<void> {
   } catch {
     return
   }
-  if (editingId) {
-    await measureTable.update(editingId, { ...form })
+  if (editingId.value) {
+    const before = measureTable.rows.value.find((item) => item.id === editingId.value)
+    await measureTable.update(editingId.value, { ...form })
     MessagePlugin.success('实测记录已更新')
+    if (before) {
+      const affected = await invalidateAdjustsForMeasure({
+        measureId: before.id,
+        valveId: before.valveId,
+        nextValveId: form.valveId,
+        action: '修改',
+        date: before.date
+      })
+      if (affected > 0) {
+        MessagePlugin.warning(`已按新数据处理：${affected} 张调节单原依据失效，相关阀门已退回待复测`)
+      }
+    }
   } else {
     await measureTable.create({ ...form }, 'ms')
     MessagePlugin.success('实测记录已保存，流量比与室温偏差已自动计算')
@@ -142,14 +169,27 @@ async function submit(): Promise<void> {
 }
 
 function remove(measure: Measure): void {
+  const frozen = frozenUsageOf(measure.id)
   const dialog = DialogPlugin.confirm({
     header: '删除确认',
-    body: `确认删除 ${measure.date} 的实测记录？`,
+    body:
+      frozen > 0
+        ? `确认删除 ${measure.date} 的实测记录？该记录是 ${frozen} 张调节单的冻结依据，删除后原复核失效、相关阀门退回待复测（原结论仍可查看）。`
+        : `确认删除 ${measure.date} 的实测记录？`,
     confirmBtn: '确认删除',
     cancelBtn: '取消',
     onConfirm: async () => {
       await measureTable.remove(measure.id)
       MessagePlugin.success('实测记录已删除')
+      const affected = await invalidateAdjustsForMeasure({
+        measureId: measure.id,
+        valveId: measure.valveId,
+        action: '删除',
+        date: measure.date
+      })
+      if (affected > 0) {
+        MessagePlugin.warning(`${affected} 张调节单原依据失效，相关阀门已退回待复测`)
+      }
       dialog.destroy()
     }
   })
@@ -366,6 +406,12 @@ async function importBatch(): Promise<void> {
           <t-input v-model="form.operator" placeholder="如 王海" />
         </t-form-item>
       </t-form>
+      <t-alert
+        v-if="editingFrozenCount > 0"
+        theme="warning"
+        :message="`该实测已被 ${editingFrozenCount} 张调节单冻结为派单/复核依据，保存修改后原复核将失效，相关阀门退回待复测，原结论仍可查看。`"
+        style="margin-bottom: 10px"
+      />
       <t-alert theme="info" :message="`当前输入失衡度约 ${previewImbalance.value.toFixed(1)}% · 判定 ${previewImbalance.level}`" />
     </t-dialog>
 

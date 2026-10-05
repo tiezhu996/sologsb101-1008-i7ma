@@ -8,6 +8,7 @@
     "dev": "vite --host --port 22808",
     "build": "vue-tsc --noEmit && vite build",
     "typecheck": "vue-tsc --noEmit",
+    "verify": "tsx scripts/verify-logic.ts",
     "preview": "vite preview --host --port 22808"
   },
   "dependencies": {
@@ -21,6 +22,8 @@
   "devDependencies": {
     "@types/node": "^22.10.5",
     "@vitejs/plugin-vue": "^5.2.1",
+    "fake-indexeddb": "^6.2.5",
+    "tsx": "^4.23.15",
     "typescript": "~5.7.3",
     "vite": "^6.1.0",
     "vue-tsc": "^2.2.0"
