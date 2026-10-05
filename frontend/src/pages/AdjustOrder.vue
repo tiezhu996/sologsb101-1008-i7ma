@@ -1,7 +1,9 @@
 <script setup lang="ts">
 /**
  * /adjusts 调节单下发与复核
- * 生成目标开度、执行回填、复核确认并导出全量 JSON。
+ * 调节单与实测分开保存：派单/执行分别冻结当时实测与阀门开度；
+ * 复核只认执行后新采集的数据；旧实测被改则退回待复测，原结论归档可查；
+ * 整批执行事务化，失败回滚开度、未完成单据保留可重试。
  * 消费 Adjust、Valve、Measure；复用 <FilterBar>、<EmptyPanel>、<StatBadge>、<BalanceTag>。
  */
 import { computed, reactive, ref, watchEffect } from 'vue'
@@ -20,10 +22,13 @@ import {
   EMPTY_ADJUST_DRAFT,
   type Adjust,
   type AdjustDraft,
-  type AdjustState
+  type AdjustState,
+  type MeasureSnapshot
 } from '@/types/adjust'
 import { basisText, formatOpening } from '@/utils/balance'
 import { exportAdjustCsv } from '@/utils/export'
+import { formatDateTime } from '@/utils/freeze'
+import type { MeasureRow } from '@/utils/db'
 import {
   DB_VERSION,
   clearAllTables,
@@ -43,16 +48,11 @@ const adjustStore = useAdjustStore()
 const valveStore = useValveStore()
 const stationStore = useStationStore()
 const rank = useImbalanceRank()
+const measureRows = rank.measureTable.rows
 
-// 把最新实测快照灌入调节单 store，用于重算失衡度
+// 全量实测灌入调节单 store（与失衡排行同一数据源，保证三处结果一致）
 watchEffect(() => {
-  adjustStore.syncLatestMeasures(
-    rank.rows.value.map((row) => ({
-      valve: row.valve,
-      measured: row.measured,
-      latest: row.latest ? { roomTempC: row.latest.roomTempC, date: row.latest.date } : null
-    }))
-  )
+  adjustStore.syncMeasures(measureRows.value as MeasureRow[])
 })
 
 const counts = ref<Record<string, number>>({})
@@ -88,13 +88,14 @@ const rows = computed(() => adjustStore.filtered)
 
 const columns = [
   { colKey: 'valve', title: '阀门 / 楼栋', width: 200, cell: 'valveCell' },
-  { colKey: 'imbalance', title: '失衡度', width: 150, cell: 'imbalanceCell' },
-  { colKey: 'opening', title: '当前 → 目标开度', width: 170, cell: 'openingCell' },
-  { colKey: 'basis', title: '调节依据', minWidth: 260, cell: 'basisCell' },
-  { colKey: 'executor', title: '执行人', width: 110 },
-  { colKey: 'state', title: '状态', width: 110, cell: 'stateCell' },
-  { colKey: 'note', title: '复核意见', width: 180, cell: 'noteCell' },
-  { colKey: 'op', title: '操作', width: 250, cell: 'opCell' }
+  { colKey: 'signed', title: '签字依据（冻结）', width: 230, cell: 'signedCell' },
+  { colKey: 'current', title: '当前最新（与排行同源）', width: 200, cell: 'currentCell' },
+  { colKey: 'opening', title: '开度冻结 → 目标', width: 160, cell: 'openingCell' },
+  { colKey: 'basis', title: '调节依据', minWidth: 240, cell: 'basisCell' },
+  { colKey: 'executor', title: '执行人', width: 100 },
+  { colKey: 'state', title: '状态', width: 100, cell: 'stateCell' },
+  { colKey: 'note', title: '复核意见 / 失效原因', width: 200, cell: 'noteCell' },
+  { colKey: 'op', title: '操作', width: 260, cell: 'opCell' }
 ]
 
 function rowKey(row: AdjustEnriched): string {
@@ -170,11 +171,22 @@ async function submit(): Promise<void> {
     return
   }
   if (editingId) {
-    await adjustStore.updateAdjust(editingId, { ...form })
-    MessagePlugin.success('调节单已更新')
+    const existing = adjustStore.adjusts.find((item) => item.id === editingId)
+    // 已执行单据不允许再改目标开度（开度已冻结到执行快照）
+    const patch: Partial<AdjustDraft> =
+      existing && existing.state !== '待下发'
+        ? { basis: form.basis, executor: form.executor }
+        : { ...form }
+    await adjustStore.updateAdjust(editingId, patch)
+    MessagePlugin.success('调节单已更新（冻结快照不随之改变）')
   } else {
-    await adjustStore.createAdjust({ ...form })
-    MessagePlugin.success('调节单已创建')
+    const valve = valveStore.valves.find((item) => item.id === form.valveId) ?? null
+    const rankRow = valve ? rank.rowOf(valve.id) : null
+    await adjustStore.createAdjust({
+      ...form,
+      basisSnapshot: valve && rankRow?.latest ? adjustStore.buildBasisSnapshot(valve, rankRow.latest) : null
+    })
+    MessagePlugin.success('调节单已创建并冻结派单时实测与开度')
   }
   dialogVisible.value = false
   await refreshCounts()
@@ -183,7 +195,7 @@ async function submit(): Promise<void> {
 function remove(adjust: Adjust): void {
   const dialog = DialogPlugin.confirm({
     header: '删除确认',
-    body: '确认删除该调节单？删除后不可恢复。',
+    body: '确认删除该调节单？删除后不可恢复（实测记录不受影响，二者分开保存）。',
     confirmBtn: '确认删除',
     cancelBtn: '取消',
     onConfirm: async () => {
@@ -195,7 +207,7 @@ function remove(adjust: Adjust): void {
   })
 }
 
-/* ---------------------------- 状态流转 ---------------------------- */
+/* ---------------------------- 状态流转 / 执行 ---------------------------- */
 
 function nextStateOf(state: AdjustState): AdjustState | null {
   return ADJUST_STATE_FLOW[state]
@@ -204,7 +216,7 @@ function nextStateOf(state: AdjustState): AdjustState | null {
 const nextStateLabel = (state: AdjustState): string => {
   const next = nextStateOf(state)
   if (next === '已调节') return '执行调节'
-  if (next === '已复核') return '复核闭环'
+  if (next === '已复核') return state === '待复测' ? '补测后复核' : '复核闭环'
   return '已闭环'
 }
 
@@ -218,31 +230,106 @@ async function advance(row: AdjustEnriched): Promise<void> {
     openReview(row)
     return
   }
-  await adjustStore.advance(row.adjust.id)
-  MessagePlugin.success(`已推进为「${next}」，目标开度已回写到阀门台账`)
-  await refreshCounts()
+  try {
+    await adjustStore.execute(row.adjust.id)
+    MessagePlugin.success('已执行：当时实测与阀门开度已冻结，目标开度已回写阀门台账')
+    await refreshCounts()
+  } catch (error) {
+    MessagePlugin.error(error instanceof Error ? error.message : '执行失败')
+  }
+}
+
+const executing = ref(false)
+
+async function executeBatch(): Promise<void> {
+  const count = adjustStore.stateCounts['待下发']
+  if (count === 0) {
+    MessagePlugin.info('没有待下发的调节单')
+    return
+  }
+  const dialog = DialogPlugin.confirm({
+    header: '整批执行确认',
+    body: `将整批执行 ${count} 张待下发调节单：逐张冻结当时实测与阀门开度并回写目标开度。中途写入失败会全部回滚、恢复本次阀门开度，未完成单据保留待下发可重试。是否继续？`,
+    confirmBtn: '整批执行',
+    cancelBtn: '取消',
+    onConfirm: async () => {
+      executing.value = true
+      try {
+        const outcome = await adjustStore.batchExecute()
+        if (outcome.executed > 0) {
+          MessagePlugin.success(`整批执行完成 ${outcome.executed} 张，阀门开度已逐张回写`)
+        }
+        if (outcome.skippedCodes.length > 0) {
+          MessagePlugin.warning(`以下阀门无最新实测已跳过：${outcome.skippedCodes.join('、')}（单据保留待下发，补录后可重试）`)
+        }
+        dialog.destroy()
+        await refreshCounts()
+      } catch (error) {
+        MessagePlugin.error(
+          `整批执行中途失败，已回滚并恢复本次阀门开度，未完成单据保留待下发，可重试。原因：${
+            error instanceof Error ? error.message : '写入失败'
+          }`
+        )
+      } finally {
+        executing.value = false
+      }
+    }
+  })
 }
 
 /* ------------------------------ 复核 ------------------------------ */
 
 const reviewVisible = ref(false)
 const reviewNote = ref('')
-const reviewTargetId = ref<string | null>(null)
-const reviewTargetLabel = ref('')
+const reviewTarget = ref<AdjustEnriched | null>(null)
+const reviewSnapshot = ref<MeasureSnapshot | null>(null)
 
 function openReview(row: AdjustEnriched): void {
-  reviewTargetId.value = row.adjust.id
-  reviewTargetLabel.value = row.valve ? row.valve.code : ''
-  reviewNote.value = row.adjust.reviewNote || '复核后流量比恢复至 0.95 以上，室温达标，同意闭环'
+  reviewTarget.value = row
+  reviewNote.value = row.adjust.reviewNote || '执行后新测流量比恢复至 0.95 以上，室温达标，同意闭环'
+  reviewSnapshot.value = reviewCandidate(row)
+  if (!reviewSnapshot.value) {
+    MessagePlugin.warning('执行后尚无新采集的实测，请先到实测录入页补测，再进行复核（旧数据不作为复核依据）')
+  }
   reviewVisible.value = true
 }
 
+function reviewCandidate(row: AdjustEnriched): MeasureSnapshot | null {
+  if (!row.valve || row.adjust.executedAt === null) return null
+  const latest = [...measureRows.value]
+    .filter((item) => item.valveId === row.valve!.id && item.createdAt > row.adjust.executedAt!)
+    .sort((a, b) => (a.date === b.date ? b.createdAt - a.createdAt : b.date.localeCompare(a.date)))[0]
+  if (!latest || !row.valve) return null
+  return adjustStore.buildBasisSnapshot(row.valve, latest)
+}
+
 async function submitReview(): Promise<void> {
-  if (!reviewTargetId.value) return
-  await adjustStore.review(reviewTargetId.value, reviewNote.value)
-  MessagePlugin.success('复核完成，调节单已闭环')
-  reviewVisible.value = false
-  await refreshCounts()
+  if (!reviewTarget.value) return
+  try {
+    await adjustStore.review(reviewTarget.value.adjust.id, reviewNote.value)
+    MessagePlugin.success('复核完成：已采用执行后新采集数据，调节单闭环')
+    reviewVisible.value = false
+    await refreshCounts()
+  } catch (error) {
+    MessagePlugin.error(error instanceof Error ? error.message : '复核失败')
+  }
+}
+
+/* --------------------------- 快照 / 原结论查看 --------------------------- */
+
+const detailVisible = ref(false)
+const detailRow = ref<AdjustEnriched | null>(null)
+
+function openDetail(row: AdjustEnriched): void {
+  detailRow.value = row
+  detailVisible.value = true
+}
+
+function snapshotText(snapshot: MeasureSnapshot | null): string {
+  if (!snapshot) return '—'
+  return `${snapshot.date} 采集 · 开度 ${formatOpening(snapshot.valveOpening)} · 流量 ${snapshot.flowM3h.toFixed(
+    1
+  )} m³/h · 流量比 ${snapshot.flowRatio.toFixed(2)} · 室温 ${snapshot.roomTempC.toFixed(1)}℃ · 失衡度 ${snapshot.imbalanceValue.toFixed(1)}%（${snapshot.level}）`
 }
 
 /* ---------------------------- 备份导出 ---------------------------- */
@@ -252,7 +339,7 @@ function exportCsv(): void {
     stationStore.stations,
     stationStore.buildings,
     valveStore.valves,
-    rank.measureTable.rows.value,
+    measureRows.value,
     adjustStore.adjusts
   )
   MessagePlugin.success(`已导出 ${filename}`)
@@ -339,10 +426,14 @@ function clearData(): void {
       <div>
         <h2 class="page-head__title">调节单下发与复核</h2>
         <p class="page-head__desc">
-          调节单状态机：待下发 → 已调节（回写阀门开度）→ 已复核（记录复核意见）。
+          实测与调节单分开保存：派单、执行分别冻结当时实测与阀门开度；复核只认执行后新采集数据；
+          旧记录被改则退回「待复测」，原结论归档可查。
         </p>
       </div>
       <div class="page-head__actions">
+        <t-button variant="outline" :loading="executing" @click="executeBatch">
+          整批执行待下发（{{ adjustStore.stateCounts['待下发'] }}）
+        </t-button>
         <t-button variant="outline" @click="exportCsv">导出调节单 CSV</t-button>
         <t-button variant="outline" @click="exportJson">导出全量 JSON</t-button>
         <t-button variant="outline" @click="triggerImport">导入 JSON</t-button>
@@ -353,6 +444,7 @@ function clearData(): void {
     <div class="stat-row">
       <StatBadge label="待下发" :value="adjustStore.stateCounts['待下发']" suffix="张" tone="warning" />
       <StatBadge label="已调节" :value="adjustStore.stateCounts['已调节']" suffix="张" tone="info" />
+      <StatBadge label="待复测" :value="adjustStore.stateCounts['待复测']" suffix="张" tone="danger" />
       <StatBadge label="已复核" :value="adjustStore.stateCounts['已复核']" suffix="张" tone="success" />
       <StatBadge label="复核率" :value="adjustStore.reviewedPercent" :percent="adjustStore.reviewedPercent" suffix="%" tone="primary" />
     </div>
@@ -367,7 +459,7 @@ function clearData(): void {
     <div class="panel" style="margin-top: 16px">
       <div class="panel-head">
         <h3 class="panel-title" style="margin: 0">调节单（{{ rows.length }} / {{ adjustStore.adjusts.length }}）</h3>
-        <span class="muted">执行人未指派时可先下发，执行后回填</span>
+        <span class="muted">签字依据为冻结快照；当前最新列与失衡排行、站内汇总同源</span>
       </div>
 
       <EmptyPanel
@@ -392,13 +484,25 @@ function clearData(): void {
             </div>
           </div>
         </template>
-        <template #imbalanceCell="{ row }">
-          <BalanceTag v-if="row.valve" :level="row.level" :imbalance="row.imbalanceValue" size="small" />
-          <span v-else class="muted">—</span>
+        <template #signedCell="{ row }">
+          <BalanceTag
+            v-if="row.signedSnapshot"
+            :level="row.signedSnapshot.level"
+            :imbalance="row.signedSnapshot.imbalanceValue"
+            size="small"
+          />
+          <div v-if="row.signedSnapshot" class="muted" style="margin-top: 2px">
+            {{ row.signedSnapshot.date }} · {{ formatOpening(row.signedSnapshot.valveOpening) }}
+          </div>
+          <span v-else class="muted">待执行冻结</span>
+        </template>
+        <template #currentCell="{ row }">
+          <BalanceTag v-if="row.hasCurrentMeasure" :level="row.currentLevel" :imbalance="row.currentImbalance" size="small" />
+          <span v-else class="muted">无新实测</span>
         </template>
         <template #openingCell="{ row }">
-          {{ row.valve ? formatOpening(row.valve.currentOpening) : '—' }} →
-          <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
+          <span class="muted">{{ row.signedSnapshot ? formatOpening(row.signedSnapshot.valveOpening) : '—' }}</span>
+          → <strong>{{ formatOpening(row.adjust.targetOpening) }}</strong>
         </template>
         <template #basisCell="{ row }">
           <span class="muted">{{ row.adjust.basis }}</span>
@@ -407,13 +511,24 @@ function clearData(): void {
           <t-tag
             size="small"
             variant="light"
-            :theme="row.adjust.state === '已复核' ? 'success' : row.adjust.state === '已调节' ? 'primary' : 'warning'"
+            :theme="
+              row.adjust.state === '已复核'
+                ? 'success'
+                : row.adjust.state === '已调节'
+                  ? 'primary'
+                  : row.adjust.state === '待复测'
+                    ? 'danger'
+                    : 'warning'
+            "
           >
             {{ row.adjust.state }}
           </t-tag>
         </template>
         <template #noteCell="{ row }">
-          <span class="muted">{{ row.adjust.reviewNote || '—' }}</span>
+          <div v-if="row.adjust.state === '待复测'" class="muted" style="color: #c0392b">
+            {{ row.adjust.invalidateReason || '依据失效，待复测' }}
+          </div>
+          <span v-else class="muted">{{ row.adjust.reviewNote || '—' }}</span>
         </template>
         <template #opCell="{ row }">
           <div class="toolbar">
@@ -426,6 +541,7 @@ function clearData(): void {
             >
               {{ nextStateLabel(row.adjust.state as AdjustState) }}
             </t-button>
+            <t-button size="small" variant="text" theme="primary" @click="openDetail(row)">冻结/原结论</t-button>
             <t-button size="small" variant="text" theme="primary" @click="openEdit(row)">编辑</t-button>
             <t-button size="small" variant="text" theme="danger" @click="remove(row.adjust)">删除</t-button>
           </div>
@@ -492,14 +608,61 @@ function clearData(): void {
 
     <t-dialog
       v-model:visible="reviewVisible"
-      :header="`复核闭环 · ${reviewTargetLabel}`"
-      width="520px"
-      :confirm-btn="'确认闭环'"
+      :header="`复核闭环 · ${reviewTarget?.valve ? reviewTarget.valve.code : ''}`"
+      width="560px"
+      :confirm-btn="reviewSnapshot ? '确认闭环' : '去补测'"
       :cancel-btn="'取消'"
-      @confirm="submitReview"
+      @confirm="reviewSnapshot ? submitReview() : (reviewVisible = false)"
     >
+      <t-alert
+        v-if="reviewSnapshot"
+        theme="success"
+        :message="`复核依据为执行后新采集：${snapshotText(reviewSnapshot)}`"
+        style="margin-bottom: 10px"
+      />
+      <t-alert
+        v-else
+        theme="warning"
+        message="执行后尚无新采集的实测数据：复核只认执行后新数据，请先补测后再复核。"
+        style="margin-bottom: 10px"
+      />
       <t-textarea v-model="reviewNote" :autosize="{ minRows: 3, maxRows: 6 }" placeholder="填写复核结论" />
-      <p class="muted">复核后调节单状态置为「已复核」，并保留复核意见。</p>
+    </t-dialog>
+
+    <t-dialog
+      v-model:visible="detailVisible"
+      :header="`冻结快照与历史结论 · ${detailRow?.valve ? detailRow.valve.code : ''}`"
+      width="640px"
+      :confirm-btn="null"
+      cancel-btn="关闭"
+    >
+      <t-descriptions v-if="detailRow" :column="1" bordered size="small">
+        <t-descriptions-item label="派单冻结（签字依据）">
+          {{ snapshotText(detailRow.basisSnapshot) }}
+        </t-descriptions-item>
+        <t-descriptions-item label="执行冻结（当时实测/开度）">
+          {{ snapshotText(detailRow.adjust.executionSnapshot) }}
+          <span v-if="detailRow.adjust.executedAt" class="muted">
+            （执行于 {{ formatDateTime(detailRow.adjust.executedAt) }}）
+          </span>
+        </t-descriptions-item>
+        <t-descriptions-item label="当前复核意见">{{ detailRow.adjust.reviewNote || '—' }}</t-descriptions-item>
+        <t-descriptions-item v-if="detailRow.adjust.invalidateReason" label="退回待复测原因">
+          <span style="color: #c0392b">{{ detailRow.adjust.invalidateReason }}</span>
+        </t-descriptions-item>
+        <t-descriptions-item label="原结论归档（仍可查看）">
+          <div v-if="detailRow.adjust.reviewHistory.length === 0" class="muted">无历史结论</div>
+          <div
+            v-for="(item, index) in detailRow.adjust.reviewHistory"
+            :key="index"
+            style="margin-bottom: 6px"
+          >
+            <strong>{{ formatDateTime(item.reviewedAt) }}</strong
+            >：{{ item.note }}
+            <div class="muted">复核快照：{{ snapshotText(item.reviewSnapshot) }}</div>
+          </div>
+        </t-descriptions-item>
+      </t-descriptions>
     </t-dialog>
   </div>
 </template>

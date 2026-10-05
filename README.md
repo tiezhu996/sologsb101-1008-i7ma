@@ -73,14 +73,22 @@ sologsb101-1008/
 | `/valves` | 阀位与设计参数登记 | Valve、Building | 登记口径/位置/开度/设计流量；开度改动进入草稿后可逐条或批量提交；失衡标签与开度校核 |
 | `/measures` | 实测流量/供回水温录入 | Measure、Valve | 按日期成组录入流量与三温；支持「阀门编号,日期,流量,供温,回温,室温,录入人」批量粘贴导入并即时预览失衡度 |
 | `/balance` | 失衡度计算与排序 | Valve、Measure | 按失衡度降序排行；仅看失衡；导出失衡度 CSV；单条/一键生成调节单 |
-| `/adjusts` | 调节单下发与复核 | Adjust、Valve、Measure | 状态机 待下发→已调节（回写阀门开度）→已复核（记录复核意见）；导出调节单 CSV 与全量 JSON |
+| `/adjusts` | 调节单下发与复核 | Adjust、Valve、Measure | 派单/执行两次冻结快照；整批执行事务化（失败回滚开度）；复核只认执行后新采数据；旧实测被改退回待复测并归档原结论；导出调节单 CSV 与全量 JSON |
 
 ## 五、数据存储说明
 
 - **IndexedDB 库名**：`gbheatgrid`（Dexie 封装，`src/utils/db.ts`）
 - **对象表**：`stations`、`buildings`、`valves`、`measures`、`adjusts`
-- **数据结构版本**：`DB_VERSION = 2`，含 `version(1)` → `version(2)` 的索引变更与 `upgrade()` 迁移（补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段）
-- **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座换热站 → 5 栋楼 → 10 只阀门 → 20 条实测 → 4 张调节单的互相引用数据；播种幂等
+- **数据结构版本**：`DB_VERSION = 3`，含 `version(1)` → `version(2)` → `version(3)` 的索引变更与 `upgrade()` 迁移
+  - v2：补齐 `revision`、用所属楼栋回填阀门 `stationId` 冗余列、规整开度与复核字段
+  - v3：**实测与调节单分开保存**。调节单新增派单冻结快照 `basisSnapshot`、执行冻结快照 `executionSnapshot`、执行时间 `executedAt`、失效原因 `invalidateReason`、复核归档 `reviewHistory`，状态机增加「待复测」；老数据升级时按当时最新实测近似回填快照
+- **签字依据冻结口径**：
+  - 派单时冻结当时实测读数与阀门开度（`basisSnapshot`），执行时再冻结一次（`executionSnapshot`）；后续补录/修改实测不改变任何历史快照
+  - **复核只认执行后新采集的实测**（`createdAt > executedAt`），无新数据时拒绝复核并提示先补测
+  - 修改/删除被快照引用的旧实测：非「待下发」单据退回「待复测」，原复核意见归档到 `reviewHistory` 仍可查看，并写明失效原因
+  - 整批执行在单个 Dexie 事务内逐张冻结并回写开度，中途写入失败整体回滚并恢复本次阀门开度，未完成单据保留「待下发」可重试
+  - 失衡排行、调节单当前值、站内汇总均取自同一最新实测口径；签字依据列展示不可变的冻结快照
+- **首屏自动播种**：`initDatabase()` 中 `if (await db.stations.count() === 0) await seedDatabase()`，播种 2 座换热站 → 5 栋楼 → 10 只阀门 → 20+ 条实测 → 5 张调节单（覆盖已复核 / 已调节 / 待下发 / 待复测全链路）的互相引用数据；播种幂等
 - **localStorage 辅助键**：`gbheatgrid:db-version`、`gbheatgrid:last-backup-at`、`gbheatgrid:ui-prefs`（上次选中换热站、仅看失衡开关）
 - 应用为**无状态容器**：数据不落容器磁盘、不使用数据库服务、不挂载命名卷
 

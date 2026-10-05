@@ -6,7 +6,7 @@ import type { Building } from '@/types/building'
 import type { Valve } from '@/types/valve'
 import type { Measure } from '@/types/measure'
 import type { Adjust } from '@/types/adjust'
-import { imbalance, balanceLevel, flowRatio } from '@/utils/balance'
+import { imbalance, flowRatio } from '@/utils/balance'
 
 export function download(filename: string, content: string, mime: string): void {
   const blob = new Blob([content], { type: mime })
@@ -53,16 +53,22 @@ export function exportAdjustCsv(
     '口径DN',
     '位置',
     '设计流量(m³/h)',
-    '实测流量(m³/h)',
-    '流量比',
-    '室温(℃)',
-    '失衡度(%)',
-    '判级',
-    '当前开度(%)',
+    '签字实测流量(m³/h)',
+    '签字实测日期',
+    '签字流量比',
+    '签字室温(℃)',
+    '签字失衡度(%)',
+    '签字判级',
+    '签字时开度(%)',
+    '当前最新实测流量(m³/h)',
+    '当前最新流量比',
+    '当前最新失衡度(%)',
     '目标开度(%)',
+    '执行时间',
     '调节依据',
     '执行人',
     '状态',
+    '失效原因',
     '复核意见'
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
@@ -76,6 +82,8 @@ export function exportAdjustCsv(
     const measured = latest ? latest.flowM3h : 0
     const room = latest ? latest.roomTempC : 0
     const value = imbalance(measured, design, room)
+    // 签字口径：已执行取执行冻结快照，否则取派单冻结快照
+    const signed = adjust.executionSnapshot ?? adjust.basisSnapshot
     lines.push(
       [
         station ? station.name : '—',
@@ -85,16 +93,22 @@ export function exportAdjustCsv(
         valve ? valve.dn : '—',
         valve ? valve.position : '—',
         design,
+        signed ? signed.flowM3h : '—',
+        signed ? signed.date : '—',
+        signed ? signed.flowRatio.toFixed(2) : '—',
+        signed ? signed.roomTempC : '—',
+        signed ? signed.imbalanceValue : '—',
+        signed ? signed.level : '—',
+        signed ? signed.valveOpening : '—',
         latest ? measured : '—',
         latest ? flowRatio(measured, design).toFixed(2) : '—',
-        latest ? room : '—',
-        value,
-        balanceLevel(value, measured, design),
-        valve ? valve.currentOpening : '—',
+        latest ? value : '—',
         adjust.targetOpening,
+        adjust.executedAt ? new Date(adjust.executedAt).toISOString().slice(0, 10) : '—',
         adjust.basis,
         adjust.executor,
         adjust.state,
+        adjust.invalidateReason || '',
         adjust.reviewNote
       ]
         .map(csvCell)

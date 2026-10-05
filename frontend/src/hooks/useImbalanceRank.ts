@@ -7,6 +7,7 @@ import { computed, type ComputedRef } from 'vue'
 import { useIdbTable, type UseIdbTableResult } from '@/hooks/useIdbTable'
 import { useStationStore } from '@/stores/stationStore'
 import { useValveStore } from '@/stores/valveStore'
+import { useAdjustStore } from '@/stores/adjustStore'
 import type { Measure } from '@/types/measure'
 import type { Valve } from '@/types/valve'
 import type { Building } from '@/types/building'
@@ -38,6 +39,8 @@ export interface ImbalanceRow {
   imbalanceValue: number
   level: BalanceLevel
   suggestOpening: number
+  /** 该阀门是否存在退回待复测的调节单 */
+  pendingRetest: boolean
 }
 
 export interface ImbalanceSummary {
@@ -63,6 +66,7 @@ export interface UseImbalanceRankResult {
 export function useImbalanceRank(): UseImbalanceRankResult {
   const stationStore = useStationStore()
   const valveStore = useValveStore()
+  const adjustStore = useAdjustStore()
   const measureTable = useIdbTable<MeasureRow>((database) => database.measures, { sortByUpdatedAt: false })
 
   const rows = computed<ImbalanceRow[]>(() => {
@@ -74,7 +78,9 @@ export function useImbalanceRank(): UseImbalanceRankResult {
     })
 
     const list = valveStore.valves.map((valve) => {
-      const own = (grouped.get(valve.id) ?? []).sort((a, b) => a.date.localeCompare(b.date))
+      const own = (grouped.get(valve.id) ?? []).sort((a, b) =>
+        a.date === b.date ? a.createdAt - b.createdAt : a.date.localeCompare(b.date)
+      )
       const latest = own.length > 0 ? own[own.length - 1] : null
       const measured = latest ? latest.flowM3h : 0
       const room = latest ? latest.roomTempC : 20
@@ -96,7 +102,8 @@ export function useImbalanceRank(): UseImbalanceRankResult {
         roomDeviation: latest ? roomDeviationC(room) : 0,
         imbalanceValue: value,
         level,
-        suggestOpening: latest ? suggestOpening(valve.currentOpening, ratio, level) : valve.currentOpening
+        suggestOpening: latest ? suggestOpening(valve.currentOpening, ratio, level) : valve.currentOpening,
+        pendingRetest: adjustStore.isPendingRetest(valve.id)
       }
     })
     return list.sort((a, b) => b.imbalanceValue - a.imbalanceValue)

@@ -39,12 +39,15 @@ const valveCountOf = (stationId: string): number =>
 const imbalancedCountOf = (stationId: string): number =>
   rank.rows.value.filter((row) => row.valve.stationId === stationId && row.level !== '平衡').length
 
+/** 待复核：已调节待复核 + 退回待复测（与调节单页同一口径） */
 const pendingReviewOf = (stationId: string): number =>
   adjustStore.adjusts.filter((adjust) => {
-    if (adjust.state === '已复核') return false
+    if (adjust.state === '已复核' || adjust.state === '待下发') return false
     const valve = valveStore.valves.find((item) => item.id === adjust.valveId)
     return valve ? valve.stationId === stationId : false
   }).length
+
+const pendingRetestOf = (stationId: string): number => adjustStore.pendingRetestCountOfStation(stationId)
 
 const stationColumns = [
   { colKey: 'name', title: '楼栋', width: 140 },
@@ -299,6 +302,9 @@ function goValves(stationId: string): void {
               · 失衡 {{ imbalancedCountOf(station.id) }}
             </span>
             <span>· 待复核 {{ pendingReviewOf(station.id) }}</span>
+            <span v-if="pendingRetestOf(station.id) > 0" style="color: #c0392b">
+              · 待复测 {{ pendingRetestOf(station.id) }}
+            </span>
           </div>
           <div class="card-list-item__meta" style="gap: 8px">
             <t-button size="small" variant="text" theme="primary" @click.stop="openEditStation(station)">

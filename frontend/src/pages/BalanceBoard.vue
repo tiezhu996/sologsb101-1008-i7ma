@@ -100,9 +100,10 @@ async function generateOne(row: ImbalanceRow): Promise<void> {
     basis: describe(row),
     executor: '待指派',
     state: '待下发',
-    reviewNote: ''
+    reviewNote: '',
+    basisSnapshot: adjustStore.buildBasisSnapshot(row.valve, row.latest)
   })
-  MessagePlugin.success(`已为 ${row.valve.code} 生成调节单，目标开度 ${row.suggestOpening}%`)
+  MessagePlugin.success(`已为 ${row.valve.code} 生成调节单并冻结当时实测与开度，目标开度 ${row.suggestOpening}%`)
 }
 
 /* --------------------------- 调节单维护 --------------------------- */
@@ -154,21 +155,19 @@ function removeAdjust(row: ImbalanceRow): void {
 async function generateAll(): Promise<void> {
   const payload = rank.rows.value
     .filter((row) => row.latest !== null && row.level !== '平衡')
+    .filter((row) => !adjustStore.hasAdjust(row.valve.id))
     .map((row) => ({
       valve: row.valve,
-      measured: row.measured,
-      roomTempC: row.latest ? row.latest.roomTempC : 20,
-      imbalanceValue: row.imbalanceValue,
-      level: row.level,
-      suggestOpening: row.suggestOpening,
-      basisText: describe(row)
+      measure: row.latest,
+      targetOpening: row.suggestOpening,
+      basis: describe(row)
     }))
   const count = await adjustStore.generateFromRank(payload)
   if (count === 0) {
     MessagePlugin.info('没有新的失衡阀门需要生成调节单')
     return
   }
-  MessagePlugin.success(`已批量生成 ${count} 张调节单`)
+  MessagePlugin.success(`已批量生成 ${count} 张调节单，并冻结派单时实测与阀门开度`)
 }
 
 function exportCsv(): void {
@@ -258,7 +257,12 @@ function goAdjust(): void {
         <template #whereCell="{ row }">
           {{ row.station ? row.station.name : '—' }} / {{ row.building ? row.building.name : '—' }}
         </template>
-        <template #codeCell="{ row }"><strong>{{ row.valve.code }}</strong></template>
+        <template #codeCell="{ row }">
+          <strong>{{ row.valve.code }}</strong>
+          <t-tag v-if="row.pendingRetest" size="small" theme="danger" variant="light" style="margin-left: 6px">
+            待复测
+          </t-tag>
+        </template>
         <template #flowCell="{ row }">
           {{ row.valve.designFlowM3h.toFixed(1) }} / {{ row.latest ? formatFlow(row.measured) : '无实测' }}
         </template>

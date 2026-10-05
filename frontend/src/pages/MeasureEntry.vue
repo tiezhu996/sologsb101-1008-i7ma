@@ -13,6 +13,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useValveStore } from '@/stores/valveStore'
 import { useStationStore } from '@/stores/stationStore'
+import { useAdjustStore } from '@/stores/adjustStore'
 import { useImbalanceRank } from '@/hooks/useImbalanceRank'
 import { EMPTY_MEASURE_DRAFT, type Measure, type MeasureDraft } from '@/types/measure'
 import type { MeasureRow } from '@/utils/db'
@@ -23,6 +24,7 @@ type FilterModel = { keyword: string; [key: string]: string | string[] | boolean
 
 const valveStore = useValveStore()
 const stationStore = useStationStore()
+const adjustStore = useAdjustStore()
 const rank = useImbalanceRank()
 const measureTable = useIdbTable<MeasureRow>((database) => database.measures, { sortByUpdatedAt: false })
 
@@ -124,6 +126,10 @@ function openEdit(measure: Measure): void {
   detailDialogVisible.value = true
 }
 
+function describeInvalidation(count: number): string {
+  return count > 0 ? `，${count} 张引用该实测的调节单已退回「待复测」，原结论已归档` : ''
+}
+
 async function submit(): Promise<void> {
   try {
     const result = await formRef.value?.validate()
@@ -132,11 +138,25 @@ async function submit(): Promise<void> {
     return
   }
   if (editingId) {
+    const previous = measureTable.rows.value.find((item) => item.id === editingId)
     await measureTable.update(editingId, { ...form })
-    MessagePlugin.success('实测记录已更新')
+    let invalidated = 0
+    if (previous) {
+      const valveCode =
+        valveStore.valves.find((item) => item.id === previous.valveId)?.code ?? '未知阀门'
+      invalidated = await adjustStore.handleMeasureChanged({
+        measureId: previous.id,
+        valveId: form.valveId,
+        extraValveIds: previous.valveId !== form.valveId ? [previous.valveId] : [],
+        kind: 'modify',
+        snapshotDate: previous.date,
+        valveCode
+      })
+    }
+    MessagePlugin.success(`实测记录已更新：调节单与实测分开保存，历史签字依据保持不变${describeInvalidation(invalidated)}`)
   } else {
     await measureTable.create({ ...form }, 'ms')
-    MessagePlugin.success('实测记录已保存，流量比与室温偏差已自动计算')
+    MessagePlugin.success('实测记录已保存：补录不改变既有调节单冻结依据，仅作为后续执行/复核的新采集数据')
   }
   detailDialogVisible.value = false
 }
@@ -144,12 +164,20 @@ async function submit(): Promise<void> {
 function remove(measure: Measure): void {
   const dialog = DialogPlugin.confirm({
     header: '删除确认',
-    body: `确认删除 ${measure.date} 的实测记录？`,
+    body: `确认删除 ${measure.date} 的实测记录？删除后引用它的调节单将退回「待复测」，原复核结论归档保留。`,
     confirmBtn: '确认删除',
     cancelBtn: '取消',
     onConfirm: async () => {
+      const valveCode = valveStore.valves.find((item) => item.id === measure.valveId)?.code ?? '未知阀门'
       await measureTable.remove(measure.id)
-      MessagePlugin.success('实测记录已删除')
+      const invalidated = await adjustStore.handleMeasureChanged({
+        measureId: measure.id,
+        valveId: measure.valveId,
+        kind: 'delete',
+        snapshotDate: measure.date,
+        valveCode
+      })
+      MessagePlugin.success(`实测记录已删除${describeInvalidation(invalidated)}`)
       dialog.destroy()
     }
   })

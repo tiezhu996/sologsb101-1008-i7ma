@@ -18,7 +18,7 @@ const navItems = computed(() => [
   { path: '/valves', label: '阀位登记', badge: String(valveStore.valves.length) },
   { path: '/measures', label: '实测录入', badge: String(rank.measureTable.rows.value.length) },
   { path: '/balance', label: '失衡度计算', badge: String(rank.summary.value.severe) },
-  { path: '/adjusts', label: '调节单', badge: String(adjustStore.stateCounts['待下发']) }
+  { path: '/adjusts', label: '调节单', badge: String(adjustStore.stateCounts['待下发'] + adjustStore.stateCounts['待复测']) }
 ])
 
 const activePath = computed(() => {
